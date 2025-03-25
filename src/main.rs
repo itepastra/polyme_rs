@@ -3,10 +3,11 @@ use std::{
     ops::{Add, Mul, Sub},
 };
 
-use fraction::GenericFraction;
-use indicatif::ProgressBar;
+use fraction::{GenericFraction, ToPrimitive};
+use indicatif::{ProgressBar, ProgressIterator};
 use num::{BigInt, BigUint};
 use rand::Rng;
+use rayon::prelude::*;
 
 use plotters::prelude::*;
 
@@ -16,8 +17,8 @@ type SmallFraction = GenericFraction<u64>;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 struct Position {
-    x: usize,
-    y: usize,
+    x: isize,
+    y: isize,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -35,14 +36,14 @@ impl From<Position> for FPosition {
     }
 }
 
-impl From<(usize, usize)> for Position {
-    fn from((x, y): (usize, usize)) -> Self {
+impl From<(isize, isize)> for Position {
+    fn from((x, y): (isize, isize)) -> Self {
         Position { x, y }
     }
 }
 
 impl Position {
-    fn sqr_len(&self) -> usize {
+    fn sqr_len(&self) -> isize {
         self.x * self.x + self.y + self.y
     }
 }
@@ -100,7 +101,7 @@ impl Lattice {
     }
 
     fn starting_point(&self) -> Position {
-        (self.start_x, self.start_y).into()
+        (self.start_x as isize, self.start_y as isize).into()
     }
 
     fn get_size(&self) -> (usize, usize) {
@@ -109,7 +110,7 @@ impl Lattice {
 
     fn adjacent(&self, &Position { x, y }: &Position) -> Vec<Position> {
         let mut avec = Vec::with_capacity(4);
-        if x < self.sites_x {
+        if x < self.sites_x as isize {
             // not on the right edge
             avec.push(Position { x: x + 1, y });
         };
@@ -117,7 +118,7 @@ impl Lattice {
             // not on the left edge
             avec.push(Position { x: x - 1, y });
         };
-        if y < self.sites_y {
+        if y < self.sites_y as isize {
             // not on the bottom edge
             avec.push(Position { x, y: y + 1 });
         };
@@ -179,11 +180,13 @@ trait Observable {
 
     fn weighted(polymers: &[Polymer], length: usize) -> Fraction {
         let numerator: Fraction = polymers
-            .iter()
+            .par_iter()
+            .filter(|poly| poly.len >= length)
             .map(|poly| Self::value(poly) * poly.weight(length).clone())
             .sum();
         let denominator: BigUint = polymers
-            .iter()
+            .par_iter()
+            .filter(|poly| poly.len >= length)
             .map(|poly| poly.weight(length).clone())
             .sum();
         numerator / denominator
@@ -265,13 +268,47 @@ impl<'a> Polymer<'a> {
         while let GrowthResult::Success = self.grow() {
             step += 1;
         }
-
         step
     }
 }
 
-const WALK_AMOUNT: usize = 1000;
-const LATTICE_SIZE: usize = 150;
+const WALK_AMOUNT: usize = 10000;
+const LATTICE_SIZE: usize = 350;
+
+fn plot_observables(
+    e2es: Vec<Fraction>,
+    gyros: Vec<Fraction>,
+    max_len: usize,
+) -> Result<(), Error> {
+    let root = BitMapBackend::new("observe.png", (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Observables", ("sans-serif", 50).into_font())
+        .margin(5)
+        .set_all_label_area_size(50)
+        .build_cartesian_2d(
+            0..max_len,
+            0.0..gyros
+                .iter()
+                .map(|gyro| ToPrimitive::to_f64(gyro).unwrap_or(f64::NAN))
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("there should be a gyro"),
+        )?;
+
+    chart.configure_mesh().draw()?;
+
+    chart.draw_series(LineSeries::new(
+        (0..max_len).map(|x| (x, ToPrimitive::to_f64(&e2es[x]).expect("waa"))),
+        RED.stroke_width(3),
+    ))?;
+    chart.draw_series(LineSeries::new(
+        (0..max_len).map(|x| (x, ToPrimitive::to_f64(&gyros[x]).expect("woo"))),
+        BLUE.stroke_width(3),
+    ))?;
+    root.present()?;
+
+    Ok(())
+}
 
 fn plot_walks(size: (usize, usize), polies: &[Polymer]) -> Result<(), Error> {
     // create a plot with all of them drawn
@@ -283,13 +320,13 @@ fn plot_walks(size: (usize, usize), polies: &[Polymer]) -> Result<(), Error> {
             ("sans-serif", 50).into_font(),
         )
         .margin(5)
+        .set_all_label_area_size(50)
         .build_cartesian_2d(0..size.0, 0..size.1)?;
 
-    chart.configure_mesh().disable_axes().draw()?;
+    chart.configure_mesh().draw()?;
 
     // draw each polymer
-    let bar = ProgressBar::new(WALK_AMOUNT as u64);
-    for walk in 0..WALK_AMOUNT {
+    for walk in (0..WALK_AMOUNT).progress() {
         let part = walk as f32 / WALK_AMOUNT as f32;
         let color = ViridisRGBA::get_color(part);
         if WALK_AMOUNT < 100 {
@@ -302,12 +339,10 @@ fn plot_walks(size: (usize, usize), polies: &[Polymer]) -> Result<(), Error> {
             polies[walk]
                 .positions
                 .iter()
-                .map(|&Position { x, y }| (x, y)),
+                .map(|&Position { x, y }| (x as usize, y as usize)),
             color.stroke_width(3),
         ))?;
-        bar.inc(1);
     }
-    bar.finish_with_message("finished generating random walks");
     root.present()?;
 
     Ok(())
@@ -328,28 +363,26 @@ fn main() -> Result<(), Error> {
 
     plot_walks(lattice.get_size(), &polies)?;
 
-    // estimate T_L
-    let total_weight: BigUint = polies
-        .iter()
-        .map(|poly| poly.weight(poly.len).clone())
-        .sum();
-    let tl = total_weight / WALK_AMOUNT;
-    println!("The estimate for T_L is {}", tl);
-
-    for length in 0..polies
-        .iter()
+    let max_poly_len = polies
+        .par_iter()
         .max_by(|a, b| a.len.cmp(&b.len))
         .expect("there is a polymer")
         .len
-    {
-        let e2e = EndToEnd::weighted(&polies, length);
-        let gyration = Gyration::weighted(&polies, length);
-        println!(
-            "L = {length}
-End to end {e2e:.5}
-Gyration {gyration:.5}"
-        );
+        - 1;
+    let e2es: Vec<_> = (0..max_poly_len)
+        .progress()
+        .map(|len| EndToEnd::weighted(&polies, len))
+        .collect();
+    let gyros: Vec<_> = (0..max_poly_len)
+        .progress()
+        .map(|len| Gyration::weighted(&polies, len))
+        .collect();
+
+    for (idx, (gyro, e2e)) in gyros.iter().zip(e2es.iter()).enumerate() {
+        println!("{} gyro: {:.2}, e2e: {:.2}", idx, gyro, e2e);
     }
+
+    plot_observables(e2es, gyros, max_poly_len)?;
 
     Ok(())
 }

@@ -852,6 +852,7 @@ dependencies = [
  "num",
  "plotters",
  "rand",
+ "rayon",
  "test-case",
 ]
 
