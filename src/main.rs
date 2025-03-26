@@ -4,12 +4,12 @@ use std::{
 };
 
 use fraction::{GenericFraction, ToPrimitive};
-use indicatif::{ProgressBar, ProgressIterator};
-use num::{BigInt, BigUint};
+use indicatif::{ProgressIterator, ProgressStyle};
+use num::BigInt;
 use rand::Rng;
 use rayon::prelude::*;
 
-use plotters::prelude::*;
+use plotters::{prelude::*, style::full_palette::PINK};
 
 type Error = Box<dyn std::error::Error>;
 type Fraction = GenericFraction<BigInt>;
@@ -19,12 +19,14 @@ type SmallFraction = GenericFraction<u64>;
 struct Position {
     x: isize,
     y: isize,
+    z: isize,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 struct FPosition {
     x: SmallFraction,
     y: SmallFraction,
+    z: SmallFraction,
 }
 
 impl From<Position> for FPosition {
@@ -32,25 +34,23 @@ impl From<Position> for FPosition {
         FPosition {
             x: value.x.into(),
             y: value.y.into(),
+            z: value.z.into(),
         }
     }
 }
 
-impl From<(isize, isize)> for Position {
-    fn from((x, y): (isize, isize)) -> Self {
-        Position { x, y }
+impl From<(isize, isize, isize)> for Position {
+    fn from((x, y, z): (isize, isize, isize)) -> Self {
+        Position { x, y, z }
     }
 }
 
 impl Position {
     fn sqr_len(&self) -> isize {
-        self.x * self.x + self.y + self.y
-    }
-}
-
-impl FPosition {
-    fn sqr_len(&self) -> SmallFraction {
-        self.x * self.x + self.y + self.y
+        let squared_x = self.x * self.x;
+        let squared_y = self.y * self.y;
+        let squared_z = self.z * self.z;
+        squared_x + squared_y + squared_z
     }
 }
 
@@ -61,13 +61,14 @@ impl Mul<FPosition> for SmallFraction {
         FPosition {
             x: self * rhs.x,
             y: self * rhs.y,
+            z: self * rhs.z,
         }
     }
 }
 
 impl Sum for Position {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        iter.fold(Position { x: 0, y: 0 }, |acc, pos| acc + pos)
+        iter.fold(Position { x: 0, y: 0, z: 0 }, |acc, pos| acc + pos)
     }
 }
 
@@ -78,6 +79,7 @@ impl Add for Position {
         Position {
             x: self.x + rhs.x,
             y: self.y + rhs.y,
+            z: self.z + rhs.z,
         }
     }
 }
@@ -86,45 +88,62 @@ impl Add for Position {
 struct Lattice {
     sites_x: usize,
     sites_y: usize,
+    sites_z: usize,
     start_x: usize,
     start_y: usize,
+    start_z: usize,
 }
 
 impl Lattice {
-    fn new(x_size: usize, y_size: usize) -> Self {
+    fn new(x_size: usize, y_size: usize, z_size: usize) -> Self {
         Lattice {
             sites_x: x_size - 1,
             sites_y: y_size - 1,
+            sites_z: z_size - 1,
             start_x: x_size / 2,
             start_y: y_size / 2,
+            start_z: z_size / 2,
         }
     }
 
     fn starting_point(&self) -> Position {
-        (self.start_x as isize, self.start_y as isize).into()
+        (
+            self.start_x as isize,
+            self.start_y as isize,
+            self.start_z as isize,
+        )
+            .into()
     }
 
-    fn get_size(&self) -> (usize, usize) {
-        (self.sites_x, self.sites_y)
+    fn get_size(&self) -> (usize, usize, usize) {
+        (self.sites_x, self.sites_y, self.sites_z)
     }
 
-    fn adjacent(&self, &Position { x, y }: &Position) -> Vec<Position> {
+    fn adjacent(&self, &Position { x, y, z }: &Position) -> Vec<Position> {
         let mut avec = Vec::with_capacity(4);
         if x < self.sites_x as isize {
             // not on the right edge
-            avec.push(Position { x: x + 1, y });
+            avec.push(Position { x: x + 1, y, z });
         };
         if x > 0 {
             // not on the left edge
-            avec.push(Position { x: x - 1, y });
+            avec.push(Position { x: x - 1, y, z });
         };
         if y < self.sites_y as isize {
             // not on the bottom edge
-            avec.push(Position { x, y: y + 1 });
+            avec.push(Position { x, y: y + 1, z });
         };
         if y > 0 {
             // not on the top edge
-            avec.push(Position { x, y: y - 1 });
+            avec.push(Position { x, y: y - 1, z });
+        };
+        if z < self.sites_z as isize {
+            // not on the top
+            avec.push(Position { x, y, z: z + 1 });
+        };
+        if z > 0 {
+            // not on the bottom
+            avec.push(Position { x, y, z: z - 1 });
         };
         avec
     }
@@ -137,6 +156,7 @@ impl Sub for FPosition {
         FPosition {
             x: self.x - rhs.x,
             y: self.y - rhs.y,
+            z: self.z - rhs.z,
         }
     }
 }
@@ -148,6 +168,7 @@ impl Sub for Position {
         Position {
             x: self.x - rhs.x,
             y: self.y - rhs.y,
+            z: self.z - rhs.z,
         }
     }
 }
@@ -155,18 +176,15 @@ impl Sub for Position {
 #[derive(Debug)]
 struct Polymer<'a> {
     positions: Vec<Position>,
-    weights: Vec<u8>,
+    weights: Vec<Fraction>,
     head: Position,
     lattice: &'a Lattice,
     len: usize,
 }
 
 impl Polymer<'_> {
-    fn weight(&self, length: usize) -> BigUint {
-        self.weights
-            .iter()
-            .take(length)
-            .fold(BigUint::new(vec![1]), |acc, new| acc * new)
+    fn weight(&self, length: usize) -> &Fraction {
+        &self.weights[length]
     }
 }
 
@@ -176,47 +194,59 @@ enum GrowthResult {
 }
 
 trait Observable {
-    fn value(polymer: &Polymer) -> Fraction;
+    fn value(polymer: &Polymer, length: usize) -> Fraction;
 
-    fn weighted(polymers: &[Polymer], length: usize) -> Fraction {
+    fn weighted(polymers: &[Polymer], length: usize, total_weight: Fraction) -> Fraction {
         let numerator: Fraction = polymers
             .par_iter()
             .filter(|poly| poly.len >= length)
-            .map(|poly| Self::value(poly) * poly.weight(length).clone())
+            .map(|poly| &Self::value(poly, length) * poly.weight(length))
             .sum();
-        let denominator: BigUint = polymers
-            .par_iter()
-            .filter(|poly| poly.len >= length)
-            .map(|poly| poly.weight(length).clone())
-            .sum();
-        numerator / denominator
+        numerator / total_weight
     }
 }
 
 struct Gyration;
 impl Gyration {
     fn pdif_center(
-        &Position { x: px, y: py }: &Position,
-        &FPosition { x: cx, y: cy }: &FPosition,
+        &Position {
+            x: px,
+            y: py,
+            z: pz,
+        }: &Position,
+        &FPosition {
+            x: cx,
+            y: cy,
+            z: cz,
+        }: &FPosition,
     ) -> Fraction {
         let diff_x = Into::<SmallFraction>::into(px) - cx;
         let diff_y = Into::<SmallFraction>::into(py) - cy;
-        let sdiff = diff_x * diff_x + diff_y * diff_y;
+        let diff_z = Into::<SmallFraction>::into(pz) - cz;
+        let sdiff = diff_x * diff_x + diff_y * diff_y + diff_z * diff_z;
 
-        sdiff.into_fraction::<BigInt>()
+        sdiff.into_fraction()
     }
 }
 
 impl Observable for Gyration {
-    fn value(polymer: &Polymer) -> Fraction {
+    fn value(polymer: &Polymer, length: usize) -> Fraction {
         let pref =
             Into::<SmallFraction>::into(1) / Into::<SmallFraction>::into(polymer.positions.len());
-        let center: FPosition =
-            pref * FPosition::from(polymer.positions.iter().map(|&pos| pos).sum::<Position>());
+        let center: FPosition = pref
+            * FPosition::from(
+                polymer
+                    .positions
+                    .iter()
+                    .take(length)
+                    .map(|&pos| pos)
+                    .sum::<Position>(),
+            );
         pref.into_fraction::<BigInt>()
             * polymer
                 .positions
                 .iter()
+                .take(length)
                 .map(|particle| Self::pdif_center(particle, &center))
                 .sum::<Fraction>()
     }
@@ -224,8 +254,10 @@ impl Observable for Gyration {
 
 struct EndToEnd;
 impl Observable for EndToEnd {
-    fn value(polymer: &Polymer) -> Fraction {
-        (polymer.head - polymer.positions[0]).sqr_len().into()
+    fn value(polymer: &Polymer, length: usize) -> Fraction {
+        (polymer.positions[length] - polymer.positions[0])
+            .sqr_len()
+            .into()
     }
 }
 
@@ -241,7 +273,8 @@ impl<'a> Polymer<'a> {
             return GrowthResult::Cornered;
         }
         self.len += 1;
-        self.weights.push(valid_adj.len() as u8);
+        self.weights
+            .push(self.weights.last().expect("starting weight exists") * valid_adj.len());
         // pick a random next position
         let next = valid_adj[rand::rng().random_range(0..valid_adj.len())];
         // set the new head
@@ -257,27 +290,71 @@ impl<'a> Polymer<'a> {
         Polymer {
             positions: vec![start],
             head: start,
-            weights: Vec::new(),
+            weights: vec![1.into()],
             lattice,
             len: 0,
         }
     }
 
-    fn grow_till_end(&mut self) -> usize {
-        let mut step = 0;
-        while let GrowthResult::Success = self.grow() {
-            step += 1;
+    fn grow_perm_till_end(
+        lattice: &'a Lattice,
+        w_low: usize,
+        w_high: usize,
+        max_len: usize,
+    ) -> Vec<Polymer<'a>> {
+        let mut polies = vec![Polymer::new(&lattice)];
+
+        polies.iter().flat_map(|poly| {
+            if poly.len < w_low {
+                if rand::random::<f32>() < 0.5 {
+                    vec![]
+                } else {
+                    poly.weights = poly.weights * 2.into();
+                    vec![poly]
+                }
+            } else if poly.len > w_high {
+                poly.weights = poly.weights / 2.into();
+                vec![poly, poly]
+            } else {
+                vec![poly]
+            }
+        });
+
+        polies
+    }
+
+    fn grow_till_end(&mut self) {
+        while let GrowthResult::Success = self.grow() {}
+        if self.len < W_LOWER {
+            if rand::random::<f32>() < 0.5 {
+                self.state = PERMState::SmallDitch
+            } else {
+                self.state = PERMState::SmallDoubleKeep
+            }
+        } else if self.len > W_UPPER {
+            self.state = PERMState::Large
+        } else {
+            self.state = PERMState::Medium
         }
-        step
     }
 }
 
-const WALK_AMOUNT: usize = 10000;
+enum Waa<'a> {
+    Lower,
+    Higher(Polymer<'a>),
+    Between,
+}
+
+const WALK_AMOUNT: usize = 10;
 const LATTICE_SIZE: usize = 350;
+
+const W_LOWER: usize = 10;
+const W_UPPER: usize = 40;
 
 fn plot_observables(
     e2es: Vec<Fraction>,
     gyros: Vec<Fraction>,
+    amounts: Vec<usize>,
     max_len: usize,
 ) -> Result<(), Error> {
     let root = BitMapBackend::new("observe.png", (1024, 768)).into_drawing_area();
@@ -291,8 +368,13 @@ fn plot_observables(
             0.0..gyros
                 .iter()
                 .map(|gyro| ToPrimitive::to_f64(gyro).unwrap_or(f64::NAN))
+                .chain(
+                    e2es.iter()
+                        .map(|e2e| ToPrimitive::to_f64(e2e).unwrap_or(f64::NAN)),
+                )
+                // this max isn't fully correct I think
                 .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .expect("there should be a gyro"),
+                .expect("there should be a gyro or e2e"),
         )?;
 
     chart.configure_mesh().draw()?;
@@ -305,12 +387,16 @@ fn plot_observables(
         (0..max_len).map(|x| (x, ToPrimitive::to_f64(&gyros[x]).expect("woo"))),
         BLUE.stroke_width(3),
     ))?;
+    chart.draw_series(LineSeries::new(
+        (0..max_len).map(|x| (x, amounts[x] as f64)),
+        PINK.stroke_width(3),
+    ))?;
     root.present()?;
 
     Ok(())
 }
 
-fn plot_walks(size: (usize, usize), polies: &[Polymer]) -> Result<(), Error> {
+fn plot_walks(size: (usize, usize, usize), polies: &[Polymer]) -> Result<(), Error> {
     // create a plot with all of them drawn
     let root = BitMapBackend::new("walk.png", (640, 640)).into_drawing_area();
     root.fill(&WHITE)?;
@@ -321,25 +407,18 @@ fn plot_walks(size: (usize, usize), polies: &[Polymer]) -> Result<(), Error> {
         )
         .margin(5)
         .set_all_label_area_size(50)
-        .build_cartesian_2d(0..size.0, 0..size.1)?;
+        .build_cartesian_3d(0..size.0, 0..size.1, 0..size.2)?;
 
-    chart.configure_mesh().draw()?;
-
+    chart.configure_axes().draw()?;
     // draw each polymer
-    for walk in (0..WALK_AMOUNT).progress() {
+    for walk in (0..WALK_AMOUNT).progress_with_style(ProgressStyle::default_bar().template("Drawing plots [{elapsed_precise}/{duration_precise} (Remaining: {eta})] {bar:40.cyan/blue} {pos:>7}/{len:7} {per_sec} {msg}")?) {
         let part = walk as f32 / WALK_AMOUNT as f32;
         let color = ViridisRGBA::get_color(part);
-        if WALK_AMOUNT < 100 {
-            println!(
-                "walk {walk} has a weights of {:?} and achieved length {}",
-                polies[walk].weights, polies[walk].len
-            );
-        }
         chart.draw_series(LineSeries::new(
             polies[walk]
                 .positions
                 .iter()
-                .map(|&Position { x, y }| (x as usize, y as usize)),
+                .map(|&Position { x, y, z }| (x as usize, y as usize, z as usize)),
             color.stroke_width(3),
         ))?;
     }
@@ -350,16 +429,13 @@ fn plot_walks(size: (usize, usize), polies: &[Polymer]) -> Result<(), Error> {
 
 fn main() -> Result<(), Error> {
     // initialize the lattice
-    let lattice = Lattice::new(LATTICE_SIZE, LATTICE_SIZE);
+    let lattice = Lattice::new(LATTICE_SIZE, LATTICE_SIZE, LATTICE_SIZE);
 
     // create and walk all of the polymers
     let mut polies: Vec<Polymer> = (0..WALK_AMOUNT).map(|_| Polymer::new(&lattice)).collect();
-    let bar = ProgressBar::new(WALK_AMOUNT as u64);
-    for poly in &mut polies {
+    polies.iter_mut().progress_with_style(ProgressStyle::default_bar().template("Generating polymers [{elapsed_precise}/{duration_precise} (Remaining: {eta})] {bar:40.cyan/blue} {pos:>7}/{len:7} {per_sec} {msg}")?).par_bridge().for_each(|poly| {
         poly.grow_till_end();
-        bar.inc(1);
-    }
-    bar.finish_with_message("finished generating random walks");
+    });
 
     plot_walks(lattice.get_size(), &polies)?;
 
@@ -367,22 +443,43 @@ fn main() -> Result<(), Error> {
         .par_iter()
         .max_by(|a, b| a.len.cmp(&b.len))
         .expect("there is a polymer")
-        .len
-        - 1;
+        .len;
+    let sum_weights: Vec<Fraction> = (0..max_poly_len)
+        .progress_with_style(ProgressStyle::default_bar().template("Weights [{elapsed_precise}/{duration_precise}] ({eta} left) {barr:40.cyan/blue} {pos:>7}/{len:7} {per_sec} {msg}")?)
+        .map(|length| {
+            polies
+                .par_iter()
+                .filter(|poly| poly.len >= length)
+                .map(|poly| poly.weight(length).clone())
+                .sum()
+        })
+        .collect();
+
     let e2es: Vec<_> = (0..max_poly_len)
-        .progress()
-        .map(|len| EndToEnd::weighted(&polies, len))
+       .progress_with_style(ProgressStyle::default_bar().template("End to End [{elapsed_precise}/{duration_precise} (Remaining: {eta})] {bar:40.cyan/blue} {pos:>7}/{len:7} {per_sec} {msg}")?) 
+        .map(|len| EndToEnd::weighted(&polies, len, sum_weights[len].clone()))
         .collect();
     let gyros: Vec<_> = (0..max_poly_len)
-        .progress()
-        .map(|len| Gyration::weighted(&polies, len))
+       .progress_with_style(ProgressStyle::default_bar().template("Gyration [{elapsed_precise}/{duration_precise} (Remaining: {eta})] {bar:40.cyan/blue} {pos:>7}/{len:7} {per_sec} {msg}")?) 
+        .map(|len| Gyration::weighted(&polies, len, sum_weights[len].clone()))
+        .collect();
+    let amounts: Vec<_> = (0..max_poly_len)
+        .map(|len| {
+            polies
+                .iter()
+                .filter(|poly| poly.len >= len)
+                .enumerate()
+                .last()
+                .unwrap()
+                .0
+        })
         .collect();
 
     for (idx, (gyro, e2e)) in gyros.iter().zip(e2es.iter()).enumerate() {
         println!("{} gyro: {:.2}, e2e: {:.2}", idx, gyro, e2e);
     }
 
-    plot_observables(e2es, gyros, max_poly_len)?;
+    plot_observables(e2es, gyros, amounts, max_poly_len)?;
 
     Ok(())
 }
